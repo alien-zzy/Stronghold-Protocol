@@ -89,7 +89,7 @@ test('classifyAddresses: IPv6 kinds, and one entry per /64', () => {
   assert.ok(list.every((a) => a.address.includes(':') ? a.kind : true), 'every IPv6 address got a kind');
 });
 
-test('lanUrls: IPv4 first, then IPv6 — bracketed, one URL per /64, never an unreachable address', async () => {
+test('lanUrls: IPv4 first, then IPv6 — bracketed, one URL per /64, and only on a family that host listens on', async () => {
   const { lanUrls } = await import('../server/index.js');
   const v6 = (address) => ({ family: 'IPv6', address, internal: false });
   const ifaces = {
@@ -104,12 +104,39 @@ test('lanUrls: IPv4 first, then IPv6 — bracketed, one URL per /64, never an un
       v6('::1'),
     ],
   };
-  assert.deepEqual(lanUrls(3000, ifaces), [
+  // HOST=:: — one dual-stack socket answers both families, so both are worth sharing
+  assert.deepEqual(lanUrls(3000, '::', ifaces), [
     'http://192.168.110.89:3000',
     'http://[240e:3b7:8c4:40f0:bb2b:c23f:a265:a95d]:3000',
   ]);
-  // The same invariant against the real interfaces of this machine.
-  for (const u of lanUrls(3000)) assert.match(u, /^http:\/\/(\[[0-9a-fA-F:]+\]|\d{1,3}(?:\.\d{1,3}){3}):3000$/, u);
+  // The default 0.0.0.0 is IPv4-only: an IPv6 URL would point at a socket that is not listening — a friend just waits
+  // for a timeout. The share list must not offer one (review of #188).
+  assert.deepEqual(lanUrls(3000, '0.0.0.0', ifaces), ['http://192.168.110.89:3000']);
+  assert.deepEqual(lanUrls(3000, undefined, ifaces), ['http://192.168.110.89:3000'], 'the default host is 0.0.0.0');
+  for (const host of ['127.0.0.1', '192.168.110.89', 'localhost']) {
+    assert.deepEqual(lanUrls(3000, host, ifaces).filter((u) => u.includes('[')), [], `${host} listens on IPv4 only`);
+  }
+  // The same invariant against the real interfaces of this machine: default settings, so no bracketed URL at all.
+  for (const u of lanUrls(3000)) assert.match(u, /^http:\/\/\d{1,3}(?:\.\d{1,3}){3}:3000$/, u);
+  for (const u of lanUrls(3000, '::')) assert.match(u, /^http:\/\/(\[[0-9a-fA-F:]+\]|\d{1,3}(?:\.\d{1,3}){3}):3000$/, u);
+});
+
+test('shareTargets: doctor and launcher drop IPv6 unless the server listens on IPv6 (#188 review)', async () => {
+  const { shareTargets, isShareTarget } = await import('../tools/doctor.mjs');
+  const ifaces = {
+    以太网: [
+      { family: 'IPv4', address: '192.168.1.7', internal: false },
+      { family: 'IPv6', address: '240e:3b7:8c4:40f0::1000', internal: false },
+    ],
+  };
+  assert.deepEqual(shareTargets('0.0.0.0', ifaces).map((a) => a.address), ['192.168.1.7'], 'the default bind: IPv4 only');
+  assert.deepEqual(shareTargets(undefined, ifaces).map((a) => a.address), ['192.168.1.7'], 'undefined host = the default');
+  assert.deepEqual(shareTargets('::', ifaces).map((a) => a.address), ['192.168.1.7', '240e:3b7:8c4:40f0::1000']);
+  assert.equal(isShareTarget({ kind: 'public', address: '240e:3b7:8c4:40f0::1' }, '0.0.0.0'), false);
+  assert.equal(isShareTarget({ kind: 'public', address: '240e:3b7:8c4:40f0::1' }, '::'), true);
+  assert.equal(isShareTarget({ kind: 'public', address: '1.2.3.4' }, '0.0.0.0'), true, 'IPv4 still travels');
+  assert.equal(isShareTarget({ kind: 'virtual', address: '2001:db8::1' }, '::'), false, 'a non-shareable kind never does');
+  assert.equal(isShareTarget({ kind: 'linklocal', address: 'fe80::1' }, '::'), false);
 });
 
 test('probePort: a host this machine cannot bind is not read as "port in use"', async () => {

@@ -14,6 +14,9 @@
 //   '6to4'      2002::/16      a deprecated 6to4 tunnel
 //   'global'    2000::/3       global unicast — the usual way in from the internet
 //   'other'     anything else (multicast, ::, IPv4-mapped, junk)
+//
+// Whether those addresses can be handed out at all also depends on the BIND — `bindsIpv6` at the bottom: with the
+// default `0.0.0.0` nothing listens on IPv6, so the share lists (boot banner, doctor, launcher) leave them out.
 
 /**
  * The first two hextets of an IPv6 literal (a zone id is dropped); null when it is not one.
@@ -57,3 +60,13 @@ export function isShareableIpv6(ip) {
   const kind = ipv6Kind(ip);
   return kind === 'ula' || kind === 'global';
 }
+
+/**
+ * Whether a bind host makes this machine reachable over IPv6 at all — only `::` does (the dual-stack bind,
+ * server/index.js `DUAL_STACK_HOST`); the default `0.0.0.0` is IPv4-only. A share list built under a V4-only bind must
+ * therefore leave every IPv6 address out: the address is real, but nothing is listening on it, so a friend who opens
+ * that URL just waits for a timeout — the review of #188 caught the boot banner, doctor and the launcher all offering
+ * those URLs anyway.
+ * @param {unknown} host a resolved bind host
+ */
+export const bindsIpv6 = (host) => host === '::';

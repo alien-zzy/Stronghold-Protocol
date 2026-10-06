@@ -20,7 +20,7 @@ import {
   checkNode, checkDeps, checkVendor, checkData, checkAssets, checkLocal, findClient, findPython,
   LOCAL_ART_FALLBACK, LOCAL_ART_COPY_HINT,
 } from './setup.mjs';
-import { ipv6Kind } from '../shared/ipv6.js';
+import { bindsIpv6, ipv6Kind } from '../shared/ipv6.js';
 
 // ---------------------------------------------------------------------------------------------------
 // LAN addresses (also used by scripts/launch.mjs)
@@ -99,6 +99,29 @@ export function classifyAddresses(ifaces = os.networkInterfaces()) {
   }
   const rank = { lan: 0, vpn: 1, public: 2, virtual: 3, linklocal: 4 };
   return out.sort((x, y) => rank[x.kind] - rank[y.kind]);
+}
+
+/**
+ * Whether one classified address is worth handing to a friend under the host this server was started with: a shareable
+ * kind (the same three `npm run doctor` and scripts/launch.mjs print) **on a family that host listens on**. Only a
+ * dual-stack bind answers IPv6 (shared/ipv6.js `bindsIpv6`) — with the default `0.0.0.0` an IPv6 URL points at a socket
+ * that is not there, which is what the review of #188 caught in all three share lists.
+ * @param {{ kind: string, address: string }} a a classifyAddresses entry
+ * @param {string} host the resolved bind host (doctor's / launcher's HOST, server srv.host)
+ */
+export function isShareTarget(a, host) {
+  if (a.kind !== 'lan' && a.kind !== 'vpn' && a.kind !== 'public') return false;
+  return bindsIpv6(host) || !String(a.address).includes(':');
+}
+
+/**
+ * The addresses to print as "发给朋友" for a given bind host — classifyAddresses, minus what that host cannot be
+ * reached on. scripts/launch.mjs prints exactly this list, so the launcher and the doctor can never disagree.
+ * @param {string} host the resolved bind host
+ * @param {ReturnType<typeof os.networkInterfaces>} [ifaces] injected in tests
+ */
+export function shareTargets(host, ifaces = os.networkInterfaces()) {
+  return classifyAddresses(ifaces).filter((a) => isShareTarget(a, host));
 }
 
 export const KIND_LABEL = { lan: '局域网', vpn: 'VPN/Tailscale/ZeroTier', public: '公网 IP', virtual: '虚拟网卡（通常无法从别的电脑访问）', linklocal: '无效地址（未获取到 IP）' };
@@ -266,8 +289,15 @@ async function main() {
   const addrs = classifyAddresses();
   if (!addrs.length) row('warn', '网络', '没有可用的 IP 地址（未联网？）');
   for (const a of addrs) {
-    const usable = a.kind === 'lan' || a.kind === 'vpn' || a.kind === 'public';
-    row(usable ? 'ok' : 'skip', hostUrl(a.address, opts.port), `${KIND_LABEL[a.kind]} · ${a.name}`);
+    const usable = isShareTarget(a, opts.host);
+    // an IPv6 address under a V4-only bind: real, but nothing answers there — say why it is not offered (#188)
+    const shareable = a.kind === 'lan' || a.kind === 'vpn' || a.kind === 'public';
+    const v6dead = !usable && shareable && a.address.includes(':');
+    row(usable ? 'ok' : 'skip', hostUrl(a.address, opts.port),
+      `${KIND_LABEL[a.kind]} · ${a.name}${v6dead ? ' · 未监听 IPv6（HOST=:: 开双栈后才可用）' : ''}`);
+  }
+  if (!bindsIpv6(opts.host) && addrs.some((a) => (a.kind === 'lan' || a.kind === 'vpn' || a.kind === 'public') && a.address.includes(':'))) {
+    row('skip', 'IPv6', `本机有 IPv6 地址，但 HOST=${opts.host} 只监听 IPv4：上面带 [ ] 的地址朋友连不上。要公网 IPv6 直连就把 HOST 设成 ::（见 docs/DEPLOY.md §2.5）`);
   }
   if (opts.host !== '0.0.0.0' && opts.host !== '::') row('warn', 'HOST', `HOST=${opts.host}：只监听这个地址，其他电脑可能连不上（默认 0.0.0.0 收全部 IPv4）`);
   else if (opts.host === '::') row('ok', 'HOST', 'HOST=:: 双栈：IPv6 与 IPv4 共用一个端口；公网 IPv6 直连请用上面带 [ ] 的地址');

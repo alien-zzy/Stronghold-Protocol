@@ -45,7 +45,7 @@ import { Lobby } from './lobby.js';
 import { getData, loadData } from './data.js';
 import { PROTOCOL_VERSION, APP_VERSION } from '../shared/constants.js';
 import { MEDIA_PREFIX, AUDIO_EXTS } from '../shared/media.js';
-import { isShareableIpv6 } from '../shared/ipv6.js';
+import { bindsIpv6, isShareableIpv6 } from '../shared/ipv6.js';
 
 /** Repository root. */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -572,21 +572,26 @@ async function streamTo(src, res, log, transform) {
 
 /**
  * Non-internal addresses as http URLs — IPv4 first, then IPv6 (an IPv6 literal needs brackets: `http://[240e:…]:3000`).
- * Only addresses worth handing to a friend: shared/ipv6.js drops link-local (a zone id cannot travel in a URL), Teredo,
- * 6to4 and the documentation range — the same rule tools/doctor.mjs lists the addresses with (review of #188).
+ * Only addresses worth handing to a friend, and only on a family this process actually listens on:
+ *   * shared/ipv6.js drops link-local (a zone id cannot travel in a URL), Teredo, 6to4 and the documentation range —
+ *     the same rule tools/doctor.mjs lists the addresses with;
+ *   * `host` gates the IPv6 half: with the default `0.0.0.0` the socket is IPv4-only, so an IPv6 URL would point at
+ *     nothing (review of #188 — banner, doctor and launcher all offered those URLs).
  * @param {number} port
+ * @param {string} host the resolved bind host (`srv.host`, after any fallback)
  * @param {ReturnType<typeof os.networkInterfaces>} [ifaces] injected in tests
  */
-export function lanUrls(port, ifaces = os.networkInterfaces()) {
+export function lanUrls(port, host = DEFAULT_BIND_HOST, ifaces = os.networkInterfaces()) {
   const v4 = [];
   const v6 = [];
   const v6Seen = new Set();
+  const ipv6 = bindsIpv6(host);
   for (const addrs of Object.values(ifaces)) {
     for (const a of addrs || []) {
       if (a.internal) continue;
       if (a.family === 'IPv4' || a.family === 4) { v4.push(`http://${a.address}:${port}`); continue; }
       if (a.family !== 'IPv6' && a.family !== 6) continue;
-      if (!isShareableIpv6(a.address)) continue;
+      if (!ipv6 || !isShareableIpv6(a.address)) continue;
       // Privacy extensions give one machine several addresses in the same /64; one URL per prefix is enough.
       const prefix = limitKeyOf(a.address);
       if (v6Seen.has(prefix)) continue;
@@ -814,7 +819,7 @@ async function main() {
   console.log(`\n  卫戍协议：盟约 · Stronghold Protocol: Alliance v${APP_VERSION}`);
   console.log(`  Local:   ${srv.url}`);
   if (srv.host === '0.0.0.0' || srv.host === '::') {
-    for (const u of lanUrls(srv.port)) console.log(`  LAN:     ${u}`);
+    for (const u of lanUrls(srv.port, srv.host)) console.log(`  LAN:     ${u}`);
   }
   console.log('  Internet: cloudflared tunnel --url ' + `http://localhost:${srv.port}` + '\n');
 
