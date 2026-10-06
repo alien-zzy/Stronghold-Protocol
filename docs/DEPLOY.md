@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1
 
 | 需求 | 命令（都加在 `powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1` 之后） |
 |---|---|
-| 换端口 / 其他设置 | `-Port 8080`、`-Verify sample`、`-Combat server`、`-BindHost 127.0.0.1`（只给反向代理用）、`-BindHost 0.0.0.0`（只收 IPv4，默认 `::` 是双栈） |
+| 换端口 / 其他设置 | `-Port 8080`、`-Verify sample`、`-Combat server`、`-BindHost ::`（双栈，宽带有公网 IPv6 时用，见 2.5）、`-BindHost 127.0.0.1`（只给反向代理用，见 2.4） |
 | 公用网络也放行 | `-AllowPublicNetwork`（一般不需要；Tailscale 网卡被识别为公用网络时可能需要） |
 | 查看状态和最近日志 | `-Status` |
 | 重启（更新代码后） | `-Restart` |
@@ -81,7 +81,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1
 winget install NSSM.NSSM            # 或从 https://nssm.cc 下载
 nssm install StrongholdProtocol "C:\Program Files\nodejs\node.exe" server\index.js
 nssm set StrongholdProtocol AppDirectory C:\Stronghold-Protocol
-nssm set StrongholdProtocol AppEnvironmentExtra PORT=3000 HOST=::
+nssm set StrongholdProtocol AppEnvironmentExtra PORT=3000 HOST=0.0.0.0   # HOST=:: 开双栈（见 2.5）
 nssm set StrongholdProtocol AppStdout C:\Stronghold-Protocol\logs\server.log
 nssm set StrongholdProtocol AppStderr C:\Stronghold-Protocol\logs\server.log
 nssm start StrongholdProtocol
@@ -176,7 +176,9 @@ https / wss 说明：页面通过 https 打开时客户端自动连接 `wss://�
 
 ### 2.5 公网 IPv6 直连（宽带有 IPv6 时最省事）
 
-服务器默认 `HOST=::`，是**双栈**：一个 3000 端口同时收 IPv6 与 IPv4。IPv6 没有 NAT，所以**不需要端口转发**，只要放行入站。
+双栈是**可选的**：默认 `HOST=0.0.0.0` 只收 IPv4，把它改成 `HOST=::` 之后，一个 3000 端口就同时收 IPv6 与 IPv4。IPv6 没有 NAT，所以**不需要端口转发**，只要放行入站。
+
+开启双栈的写法：启动脚本加 `--host ::`；开机自启加 `-BindHost ::`；systemd / NSSM / Docker 设 `HOST=::`（`Environment=` / `AppEnvironmentExtra` / `-e HOST=::`）。
 
 1. 确认这台电脑有**公网 IPv6**（`240e:` / `2409:` / `2408:` 等开头；`fe80::` 开头的只是链路本地地址，不能用）。启动窗口和 `node tools/doctor.mjs` 会列出带方括号的 `http://[…]:3000`，那就是它。
 2. 放行入站：
@@ -230,6 +232,7 @@ services:
   [Service]
   WorkingDirectory=/opt/Stronghold-Protocol
   ExecStart=/usr/bin/node server/index.js
+  # HOST=:: 开双栈（见 2.5）；默认 0.0.0.0 只收 IPv4
   Environment=PORT=3000 HOST=0.0.0.0
   Restart=always
   RestartSec=5

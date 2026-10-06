@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // tools/doctor.mjs — diagnose an install (docs/DEPLOY.md「排错」). Read-only: changes nothing.
 //
-//   node tools/doctor.mjs [--port 3000] [--host ::]
+//   node tools/doctor.mjs [--port 3000] [--host 0.0.0.0]
 //
 // Checks: Node/npm versions, dependencies, public/vendor, data/*.json, downloaded art/audio, optional local-client art,
 // Python (only needed for the optional extraction), the port (free / our server running → /healthz / another
@@ -20,6 +20,7 @@ import {
   checkNode, checkDeps, checkVendor, checkData, checkAssets, checkLocal, findClient, findPython,
   LOCAL_ART_FALLBACK, LOCAL_ART_COPY_HINT,
 } from './setup.mjs';
+import { ipv6Kind } from '../shared/ipv6.js';
 
 // ---------------------------------------------------------------------------------------------------
 // LAN addresses (also used by scripts/launch.mjs)
@@ -35,34 +36,27 @@ const VPN_IF = /(tailscale|zerotier|^zt|wireguard|^wg\d|tun\d|tap|radmin|hamachi
 function ipv4ToInt(ip) { return ip.split('.').reduce((n, x) => (n << 8) + Number(x), 0) >>> 0; }
 function inCidr(ip, base, bits) { const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0; return (ipv4ToInt(ip) & mask) === (ipv4ToInt(base) & mask); }
 
-/** The first two hextets of an IPv6 address (a zone id is dropped); null when it cannot be parsed. @param {string} ip */
-function ipv6Head(ip) {
-  const [a = '', b = ''] = String(ip).split('%')[0].split(':');
-  const h1 = parseInt(a, 16);
-  if (!Number.isInteger(h1)) return null;
-  const h2 = parseInt(b, 16);
-  return [h1, Number.isInteger(h2) ? h2 : 0];
-}
-
 /** An http URL for one address — an IPv6 literal needs brackets. Also used by scripts/launch.mjs. */
 export function hostUrl(address, port) {
   return `http://${String(address).includes(':') ? `[${address}]` : address}:${port}`;
 }
 
-/** IPv6 counterpart of the IPv4 chain below (same order, same kinds). @param {string} name @param {string} ip */
+/**
+ * IPv6 counterpart of the IPv4 chain below (same order, same kinds). The address bits come from shared/ipv6.js — the
+ * single copy of that rule, shared with server/index.js `lanUrls` (review of #188).
+ * @param {string} name @param {string} ip
+ */
 function classifyV6(name, ip) {
-  const head = ipv6Head(ip);
-  if (!head) return 'virtual';
-  const [h1, h2] = head;
+  const kind = ipv6Kind(ip);
   // fe80::/10 needs a zone id (%12 / %eth0) that a URL cannot carry, so it is no use to a friend.
-  if ((h1 & 0xffc0) === 0xfe80) return 'linklocal';
-  // The IPv6 equivalents of the 198.18/15 special case: 2002::/16 (6to4) and 2001:db8::/32 (documentation) are never
-  // an address to hand out.
-  if (h1 === 0x2002 || (h1 === 0x2001 && h2 === 0x0db8)) return 'virtual';
+  if (kind === 'linklocal') return 'linklocal';
+  // The IPv6 equivalents of the 198.18/15 special case: 6to4, Teredo and the documentation range are never an address
+  // to hand out — a Teredo address showing up in the share list is what the review caught.
+  if (kind === 'teredo' || kind === '6to4' || kind === 'doc') return 'virtual';
   if (VPN_IF.test(name)) return 'vpn';
   if (VIRTUAL_IF.test(name)) return 'virtual';
-  if ((h1 & 0xfe00) === 0xfc00) return 'lan';   // fc00::/7 ULA — the IPv6 RFC 1918
-  if ((h1 & 0xe000) === 0x2000) return 'public'; // 2000::/3 global unicast
+  if (kind === 'ula') return 'lan';      // fc00::/7 — the IPv6 RFC 1918
+  if (kind === 'global') return 'public'; // 2000::/3 global unicast
   return 'virtual';
 }
 
@@ -126,7 +120,7 @@ function getJson(url, timeoutMs = 1500) {
   });
 }
 
-function canListen(port, host) {
+function tryListen(port, host) {
   return new Promise((resolve) => {
     const srv = net.createServer();
     srv.once('error', (e) => resolve({ ok: false, code: e.code }));
@@ -134,8 +128,23 @@ function canListen(port, host) {
   });
 }
 
+/** Bind errors that mean "this machine cannot bind that host at all", not "the port is taken by someone else". */
+const BIND_UNAVAILABLE = new Set(['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL']);
+
+/**
+ * Can we bind this port on `host`? A host this machine cannot bind at all — `::` with IPv6 switched off, an IPv6
+ * address that is not configured — is retried as `0.0.0.0`, exactly like the server's own fallback (server/index.js).
+ * Without it, `probePort` (and so `npm run doctor` and scripts/launch.mjs) read EAFNOSUPPORT as "port busy" and
+ * refused to start on such a machine (review of #188).
+ */
+async function canListen(port, host) {
+  const first = await tryListen(port, host);
+  if (first.ok || host === '0.0.0.0' || !BIND_UNAVAILABLE.has(first.code)) return first;
+  return tryListen(port, '0.0.0.0');
+}
+
 /** 'ours' (our server answers /healthz), 'free', 'busy' (another program) or 'denied'. */
-export async function probePort(port, host = '::') {
+export async function probePort(port, host = '0.0.0.0') {
   const r = await getJson(`http://127.0.0.1:${port}/healthz`);
   if (r.json && r.json.ok === true && 'uptimeSec' in r.json) return { state: 'ours', health: r.json };
   const l = await canListen(port, host);
@@ -191,7 +200,7 @@ function tool(cmd, args) {
 // ---------------------------------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const o = { port: Number(process.env.PORT) || 3000, host: process.env.HOST || '::', help: false };
+  const o = { port: Number(process.env.PORT) || 3000, host: process.env.HOST || '0.0.0.0', help: false };
   for (let i = 0; i < argv.length; i++) {
     const [k, v] = argv[i].split('=');
     const val = () => (v !== undefined ? v : argv[++i]);
@@ -206,7 +215,7 @@ function parseArgs(argv) {
 async function main() {
   let opts;
   try { opts = parseArgs(process.argv.slice(2)); } catch (e) { console.error(e.message); return 2; }
-  if (opts.help) { console.log('node tools/doctor.mjs [--port 3000] [--host ::]  — 只读诊断，不修改任何文件'); return 0; }
+  if (opts.help) { console.log('node tools/doctor.mjs [--port 3000] [--host 0.0.0.0]  — 只读诊断，不修改任何文件'); return 0; }
   const rows = [];
   let bad = false;
   const row = (state, label, detail = '') => { rows.push([state, label, detail]); if (state === 'err') bad = true; };
@@ -251,7 +260,7 @@ async function main() {
   else if (port.state === 'denied') row('err', `端口 ${opts.port}`, '没有权限监听（Linux 上 < 1024 的端口需要 root）→ 换一个 PORT');
   else row('err', `端口 ${opts.port}`, `被其他程序占用（${port.code}）→ 关闭它或换端口：${IS_WIN ? '$env:PORT=3001; npm start' : 'PORT=3001 npm start'}`);
   const env = ['PORT', 'HOST', 'SP_COMBAT', 'SP_VERIFY', 'TRUST_PROXY', 'DEBUG'].filter((k) => process.env[k] != null && process.env[k] !== '');
-  row('skip', '环境变量', env.length ? env.map((k) => `${k}=${process.env[k]}`).join(' ') : '全部默认（PORT=3000 HOST=:: SP_COMBAT=client SP_VERIFY=off）');
+  row('skip', '环境变量', env.length ? env.map((k) => `${k}=${process.env[k]}`).join(' ') : '全部默认（PORT=3000 HOST=0.0.0.0 SP_COMBAT=client SP_VERIFY=off）');
 
   section('朋友如何访问');
   const addrs = classifyAddresses();
@@ -260,8 +269,8 @@ async function main() {
     const usable = a.kind === 'lan' || a.kind === 'vpn' || a.kind === 'public';
     row(usable ? 'ok' : 'skip', hostUrl(a.address, opts.port), `${KIND_LABEL[a.kind]} · ${a.name}`);
   }
-  if (opts.host !== '0.0.0.0' && opts.host !== '::') row('warn', 'HOST', `HOST=${opts.host}：只监听这个地址，其他电脑可能连不上（默认 :: 双栈，IPv6 与 IPv4 都收）`);
-  else if (opts.host === '::') row('ok', 'HOST', 'HOST=:: 双栈：IPv6 与 IPv4 使用同一个端口；公网 IPv6 直连用上面带 [ ] 的地址');
+  if (opts.host !== '0.0.0.0' && opts.host !== '::') row('warn', 'HOST', `HOST=${opts.host}：只监听这个地址，其他电脑可能连不上（默认 0.0.0.0 收全部 IPv4）`);
+  else if (opts.host === '::') row('ok', 'HOST', 'HOST=:: 双栈：IPv6 与 IPv4 共用一个端口；公网 IPv6 直连请用上面带 [ ] 的地址');
 
   section('防火墙');
   for (const [m, text] of firewallHints(opts.port)) rows.push([m === '' ? 'raw' : 'mark', text, '', m]);

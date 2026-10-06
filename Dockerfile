@@ -13,7 +13,7 @@
 # Without any art the game still runs with placeholder visuals.
 #
 # Run:  docker run -d --name stronghold -p 3000:3000 --restart unless-stopped stronghold-protocol
-# Env:  PORT (3000), HOST (:: — one dual-stack socket, IPv6 + IPv4; 0.0.0.0 = IPv4 only), SP_COMBAT (client|server),
+# Env:  PORT (3000), HOST (0.0.0.0 = IPv4 only; set :: for one dual-stack socket, IPv6 + IPv4), SP_COMBAT (client|server),
 #       SP_VERIFY (off|sample|all), TRUST_PROXY (auto|1|0), DEBUG
 
 ARG NODE_IMAGE=node:22-alpine
@@ -44,7 +44,7 @@ RUN node tools/vendor.mjs \
 FROM ${NODE_IMAGE}
 ENV NODE_ENV=production \
     PORT=3000 \
-    HOST=::
+    HOST=0.0.0.0
 WORKDIR /app
 COPY --from=deps /app/package.json ./package.json
 COPY --from=deps /app/node_modules ./node_modules

@@ -18,10 +18,10 @@
 //     single byte-range requests (206/416, used by <audio>); traversal & dotfile protection; 404 page.
 //   * GET /healthz → JSON status (protocol `version`, release `app`, rooms, matches, sessions, sockets).
 //   * WebSocket (ws) at /ws, maxPayload 64 KB → server/net.js Network → server/lobby.js Lobby.
-//   * Env: PORT (default 3000), HOST (default :: — one dual-stack socket answering IPv6 **and** IPv4; set
-//     127.0.0.1 behind a reverse proxy, or 0.0.0.0 for IPv4 only), TRUST_PROXY ('auto' default: honour CF-Connecting-IP /
-//     X-Real-IP / X-Forwarded-For only from loopback/private peers such as a local cloudflared; '1' always; '0' never).
-//     Prints LAN URLs (IPv4 and IPv6) on boot.
+//   * Env: PORT (default 3000), HOST (default 0.0.0.0 = IPv4 only; `::` = one dual-stack socket answering IPv6 **and**
+//     IPv4 — opt in on a line that has a public IPv6 prefix; 127.0.0.1 = loopback only, behind a reverse proxy),
+//     TRUST_PROXY ('auto' default: honour CF-Connecting-IP / X-Real-IP / X-Forwarded-For only from loopback/private
+//     peers such as a local cloudflared; '1' always; '0' never). Prints LAN URLs (IPv4 and IPv6) on boot.
 //   * Per-network limits for internet clients (see net.js clientAddress; local/LAN peers are exempt): open sockets
 //     (maxConnectionsPerAddr, refused at upgrade with 429), rooms and running matches (lobby.js).
 //   * Graceful shutdown on SIGINT/SIGTERM (rooms get room.closed{reason:'shutdown'}, sockets close 1001).
@@ -45,6 +45,7 @@ import { Lobby } from './lobby.js';
 import { getData, loadData } from './data.js';
 import { PROTOCOL_VERSION, APP_VERSION } from '../shared/constants.js';
 import { MEDIA_PREFIX, AUDIO_EXTS } from '../shared/media.js';
+import { isShareableIpv6 } from '../shared/ipv6.js';
 
 /** Repository root. */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -571,19 +572,21 @@ async function streamTo(src, res, log, transform) {
 
 /**
  * Non-internal addresses as http URLs — IPv4 first, then IPv6 (an IPv6 literal needs brackets: `http://[240e:…]:3000`).
+ * Only addresses worth handing to a friend: shared/ipv6.js drops link-local (a zone id cannot travel in a URL), Teredo,
+ * 6to4 and the documentation range — the same rule tools/doctor.mjs lists the addresses with (review of #188).
  * @param {number} port
+ * @param {ReturnType<typeof os.networkInterfaces>} [ifaces] injected in tests
  */
-export function lanUrls(port) {
+export function lanUrls(port, ifaces = os.networkInterfaces()) {
   const v4 = [];
   const v6 = [];
   const v6Seen = new Set();
-  for (const addrs of Object.values(os.networkInterfaces())) {
+  for (const addrs of Object.values(ifaces)) {
     for (const a of addrs || []) {
       if (a.internal) continue;
       if (a.family === 'IPv4' || a.family === 4) { v4.push(`http://${a.address}:${port}`); continue; }
       if (a.family !== 'IPv6' && a.family !== 6) continue;
-      // Link-local needs a zone id (%eth0) that a URL cannot carry, so it is useless to a friend — left out.
-      if (/^fe80:/i.test(a.address)) continue;
+      if (!isShareableIpv6(a.address)) continue;
       // Privacy extensions give one machine several addresses in the same /64; one URL per prefix is enough.
       const prefix = limitKeyOf(a.address);
       if (v6Seen.has(prefix)) continue;
@@ -613,11 +616,18 @@ function makeLogger(quiet) {
 }
 
 /**
- * Bind address used when neither `opts.host` nor `HOST` says otherwise: one dual-stack socket, so the server answers
- * IPv6 and IPv4 alike without a second listener (Node keeps `ipv6Only` off for `::`). `HOST=0.0.0.0` still means
- * IPv4 only, `HOST=127.0.0.1` still means loopback only (a reverse proxy in front).
+ * Bind address used when neither `opts.host` nor `HOST` says otherwise: `0.0.0.0`, IPv4 on every interface. That is
+ * the long-standing default and it stays (review of #188): a machine that happens to have a public IPv6 prefix and an
+ * open firewall would otherwise start answering the whole internet the moment it upgrades. Dual-stack is opt-in.
  */
-export const DEFAULT_BIND_HOST = '::';
+export const DEFAULT_BIND_HOST = '0.0.0.0';
+
+/**
+ * The opt-in dual-stack bind, `HOST=::`: one socket answers IPv6 *and* IPv4 (Node keeps `ipv6Only` off for `::`), so a
+ * household with a public IPv6 prefix is reachable without a tunnel, a second listener or a port forward — IPv6 has
+ * no NAT, only the inbound firewall matters.
+ */
+export const DUAL_STACK_HOST = '::';
 
 /**
  * Build and start the HTTP + WebSocket server.
@@ -726,8 +736,8 @@ export async function startServer(opts = {}) {
   });
 
   // A host with IPv6 switched off (an old kernel, a container started with IPv6 disabled) refuses to bind '::' — fall
-  // back to IPv4 rather than not booting at all. Only the default is retried: an explicit HOST is taken literally.
-  const candidates = host === DEFAULT_BIND_HOST ? [DEFAULT_BIND_HOST, '0.0.0.0'] : [host];
+  // back to IPv4 rather than not booting at all. Only dual-stack is retried: any other explicit HOST is literal.
+  const candidates = host === DUAL_STACK_HOST ? [DUAL_STACK_HOST, DEFAULT_BIND_HOST] : [host];
   let bound = null;
   let lastError = null;
   for (const candidate of candidates) {
